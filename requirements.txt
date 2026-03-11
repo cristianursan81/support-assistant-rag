@@ -3,6 +3,7 @@ langchain==0.3.14
 langchain-community==0.3.14
 langchain-ollama==0.2.3
 langchain-chroma==0.2.2
+langchain-huggingface==0.1.2        # ✅ reemplaza HuggingFaceEmbeddings deprecated
 
 # Embeddings (GPU)
 sentence-transformers==3.4.1
@@ -21,5 +22,5 @@ gradio==5.14.0
 python-dotenv==1.0.1
 tqdm==4.67.1
 
-# PyTorch con CUDA se instala por separado (ver README)
-# pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+# PyTorch con CUDA (Blackwell RTX 5070 Ti — instalar por separado):
+# pip install --pre torch torchvision torchaudio --index-url https://download.pytorch.org/whl/nightly/cu128
