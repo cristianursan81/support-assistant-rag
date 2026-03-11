@@ -102,7 +102,7 @@ class SupportAssistant:
             k=6,
             memory_key="chat_history",
             output_key="answer",
-            return_messages=False,
+            return_messages=True,
         )
 
         # Cadena conversacional con memoria
