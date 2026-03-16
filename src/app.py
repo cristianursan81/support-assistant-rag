@@ -1,18 +1,19 @@
 """
-app.py  ·  v2.0
----------------
-Interfaz premium para Support Assistant RAG.
-Diseño: Ops Dashboard — dark, profesional, listo para entrevistas.
+app.py  ·  v2.1  —  VERSIÓN LIMPIA Y DEFINITIVA
+------------------------------------------------
+Support Assistant RAG · Cristian Ursan
+Tema: Negro y verde terminal (Matrix/CRT)
+Features: Streaming, memoria de conversación, UI premium
 """
 
 import sys
 import os
-import time
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import gradio as gr
 from src.rag import get_assistant
 
+# ── Preguntas de ejemplo ────────────────────────────────────────────
 EXAMPLE_QUESTIONS = [
     "¿Cuál es el proceso de escalado para clientes premium?",
     "¿Qué KPIs usas para medir la performance de un equipo de soporte?",
@@ -24,35 +25,53 @@ EXAMPLE_QUESTIONS = [
     "¿Cuáles son las 10 automatizaciones más importantes en Zendesk?",
 ]
 
+# ── CSS: Tema Matrix / Terminal CRT ────────────────────────────────
 CUSTOM_CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=DM+Sans:wght@300;400;500;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=VT323&family=Roboto+Mono:wght@300;400;500&display=swap');
 
 :root {
-    --bg-primary:    #090c10;
-    --bg-secondary:  #0f1318;
-    --bg-card:       #141920;
-    --bg-hover:      #1a2030;
-    --border:        #1e2a3a;
-    --border-bright: #243040;
-    --accent:        #00d4ff;
-    --accent-dim:    #0090b3;
-    --accent-glow:   rgba(0, 212, 255, 0.12);
-    --green:         #00ff88;
-    --green-dim:     #00cc6a;
-    --amber:         #ffb800;
-    --text-primary:  #e8edf5;
-    --text-secondary:#8a9bb5;
-    --text-muted:    #4a5a70;
-    --font-mono:     'Space Mono', monospace;
-    --font-sans:     'DM Sans', sans-serif;
+    --bg-primary:    #1a1a1a;
+    --bg-secondary:  #1f261f;
+    --bg-card:       #222e22;
+    --bg-msg:        #1c231c;
+    --border:        #0a2a0a;
+    --border-bright: #0f3f0f;
+    --accent:        #00ff41;
+    --accent-dim:    #00cc33;
+    --accent-glow:   rgba(0, 255, 65, 0.15);
+    --accent-dark:   rgba(0, 255, 65, 0.05);
+    --green-bright:  #39ff14;
+    --green-dim:     #007a1e;
+    --green-muted:   #004410;
+    --text-body:     #b8ffcc;
+    --font-mono:     'Share Tech Mono', monospace;
+    --font-display:  'VT323', monospace;
+    --font-body:     'Roboto Mono', monospace;
 }
 
 * { box-sizing: border-box; }
 
+/* Scanlines CRT */
+body::before {
+    content: '';
+    position: fixed;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    background: repeating-linear-gradient(
+        0deg,
+        transparent,
+        transparent 2px,
+        rgba(0, 255, 65, 0.015) 2px,
+        rgba(0, 255, 65, 0.015) 4px
+    );
+    pointer-events: none;
+    z-index: 9999;
+}
+
 body, .gradio-container {
     background: var(--bg-primary) !important;
-    font-family: var(--font-sans) !important;
-    color: var(--text-primary) !important;
+    font-family: var(--font-mono) !important;
+    color: var(--accent) !important;
 }
 
 .gradio-container {
@@ -63,251 +82,257 @@ body, .gradio-container {
 
 /* ── HEADER ── */
 .header-wrap {
-    padding: 40px 40px 0;
-    border-bottom: 1px solid var(--border);
-    margin-bottom: 0;
+    padding: 32px 40px 0;
+    border-bottom: 1px solid var(--border-bright);
+    position: relative;
+}
+
+.header-wrap::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent), transparent);
+    animation: glowline 3s ease-in-out infinite;
+}
+
+@keyframes glowline {
+    0%, 100% { opacity: 0.3; }
+    50% { opacity: 1; }
 }
 
 .header-top {
     display: flex;
     align-items: center;
     gap: 16px;
-    margin-bottom: 8px;
+    margin-bottom: 4px;
 }
 
 .status-dot {
-    width: 8px; height: 8px;
+    width: 10px; height: 10px;
     border-radius: 50%;
-    background: var(--green);
-    box-shadow: 0 0 8px var(--green);
-    animation: pulse 2s ease-in-out infinite;
+    background: var(--accent);
+    box-shadow: 0 0 6px var(--accent), 0 0 12px var(--accent), 0 0 24px var(--accent);
+    animation: blink 1.2s step-end infinite;
     flex-shrink: 0;
 }
 
-@keyframes pulse {
+@keyframes blink {
     0%, 100% { opacity: 1; }
-    50% { opacity: 0.4; }
+    50% { opacity: 0.1; }
 }
 
 .header-title {
-    font-family: var(--font-mono) !important;
-    font-size: 22px !important;
-    font-weight: 700 !important;
+    font-family: var(--font-display) !important;
+    font-size: 38px !important;
+    font-weight: 400 !important;
     color: var(--accent) !important;
-    letter-spacing: -0.5px;
+    letter-spacing: 4px !important;
     margin: 0 !important;
     line-height: 1 !important;
+    text-shadow: 0 0 10px var(--accent), 0 0 30px var(--accent-dim);
 }
 
 .header-sub {
-    font-size: 12px !important;
-    color: var(--text-muted) !important;
+    font-size: 10px !important;
+    color: var(--green-dim) !important;
     font-family: var(--font-mono) !important;
-    letter-spacing: 2px;
+    letter-spacing: 3px;
     text-transform: uppercase;
-    margin: 0 0 20px !important;
-    padding-left: 24px;
+    margin: 2px 0 16px !important;
+    padding-left: 26px;
 }
 
 .header-meta {
     display: flex;
-    gap: 24px;
-    padding: 14px 0;
+    gap: 28px;
+    padding: 12px 0;
     border-top: 1px solid var(--border);
 }
 
 .meta-chip {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
+    font-size: 10px;
     font-family: var(--font-mono);
-    color: var(--text-muted);
+    color: var(--green-dim);
     text-transform: uppercase;
     letter-spacing: 1px;
 }
 
+.meta-chip::before { content: '> '; color: var(--accent-dim); }
 .meta-chip span {
     color: var(--accent);
-    font-weight: 700;
+    text-shadow: 0 0 6px var(--accent);
 }
 
-/* ── MAIN LAYOUT ── */
-.main-wrap {
-    padding: 24px 40px 40px;
-}
+/* ── MAIN ── */
+.main-wrap { padding: 20px 40px 40px; }
 
 /* ── CHATBOT ── */
 .chatbot-wrap .label-wrap { display: none !important; }
 
 .chatbot-wrap > div {
     background: var(--bg-secondary) !important;
-    border: 1px solid var(--border) !important;
-    border-radius: 12px !important;
-    overflow: hidden !important;
+    border: 1px solid var(--border-bright) !important;
+    border-radius: 2px !important;
+    box-shadow: 0 0 30px rgba(0,255,65,0.04), inset 0 0 60px rgba(0,0,0,0.6) !important;
 }
 
-/* Mensajes del usuario */
+/* Usuario */
 .message.user, div[data-testid="user"] {
-    background: #1a2535 !important;
-    border: 1px solid #2a3a55 !important;
-    border-radius: 10px 10px 2px 10px !important;
-    color: #e8edf5 !important;
-    font-family: var(--font-sans) !important;
-    font-size: 14px !important;
+    background: var(--bg-card) !important;
+    border: 1px solid var(--border-bright) !important;
+    border-radius: 2px !important;
+    color: var(--accent) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 13px !important;
     line-height: 1.6 !important;
-    padding: 14px 18px !important;
+    padding: 12px 16px !important;
 }
 
-/* Mensajes del asistente */
+/* Asistente */
 .message.bot, div[data-testid="bot"] {
-    background: #0f1820 !important;
-    border: 1px solid #1e2a3a !important;
-    border-left: 3px solid var(--accent) !important;
-    border-radius: 2px 10px 10px 10px !important;
-    color: #e8edf5 !important;
-    font-family: var(--font-sans) !important;
-    font-size: 14px !important;
-    line-height: 1.75 !important;
+    background: var(--bg-msg) !important;
+    border: 1px solid var(--border) !important;
+    border-left: 2px solid var(--accent) !important;
+    border-radius: 0 2px 2px 0 !important;
+    color: var(--text-body) !important;
+    font-family: var(--font-body) !important;
+    font-size: 13px !important;
+    line-height: 1.85 !important;
     padding: 16px 20px !important;
 }
 
-/* Forzar color de texto en todos los elementos internos */
-.message p, .message li, .message span,
-div[data-testid="bot"] p, div[data-testid="bot"] li,
-div[data-testid="bot"] span, div[data-testid="bot"] div {
-    color: #e8edf5 !important;
+/* Forzar colores internos del asistente */
+div[data-testid="bot"],
+div[data-testid="bot"] p,
+div[data-testid="bot"] li,
+div[data-testid="bot"] span,
+div[data-testid="bot"] div,
+div[data-testid="bot"] * {
+    color: #b8ffcc !important;
 }
 
-div[data-testid="bot"] strong, .message.bot strong {
-    color: #00d4ff !important;
-    font-weight: 600 !important;
+div[data-testid="bot"] strong {
+    color: var(--green-bright) !important;
+    text-shadow: 0 0 6px var(--accent);
 }
 
-div[data-testid="bot"] code, .message.bot code {
-    background: #050a10 !important;
-    color: #00ff88 !important;
+div[data-testid="bot"] code {
+    background: #162016 !important;
+    color: var(--accent) !important;
     font-family: var(--font-mono) !important;
-    padding: 2px 6px !important;
-    border-radius: 4px !important;
-    font-size: 12px !important;
+    padding: 1px 6px !important;
+    border: 1px solid var(--border-bright) !important;
+    border-radius: 2px !important;
+    font-size: 11px !important;
 }
 
-div[data-testid="bot"] ul, div[data-testid="bot"] ol {
-    padding-left: 20px !important;
-    margin: 8px 0 !important;
-}
-
+div[data-testid="bot"] ul,
+div[data-testid="bot"] ol { padding-left: 20px !important; margin: 8px 0 !important; }
 div[data-testid="bot"] li { margin-bottom: 6px !important; }
-div[data-testid="bot"] p { margin: 0 0 10px !important; }
+div[data-testid="bot"] p  { margin: 0 0 10px !important; }
 
 /* ── INPUT ── */
 .input-wrap { margin-top: 12px; }
 
 .input-wrap textarea {
-    background: var(--bg-secondary) !important;
+    background: #1e261e !important;
     border: 1px solid var(--border-bright) !important;
-    border-radius: 10px !important;
-    color: var(--text-primary) !important;
-    font-family: var(--font-sans) !important;
-    font-size: 14px !important;
+    border-radius: 2px !important;
+    color: var(--accent) !important;
+    font-family: var(--font-mono) !important;
+    font-size: 13px !important;
     padding: 14px 18px !important;
     resize: none !important;
-    transition: border-color 0.2s ease !important;
+    caret-color: var(--accent) !important;
+    transition: border-color 0.15s, box-shadow 0.15s !important;
 }
 
 .input-wrap textarea:focus {
     border-color: var(--accent) !important;
-    box-shadow: 0 0 0 3px var(--accent-glow) !important;
+    box-shadow: 0 0 0 1px var(--accent), 0 0 15px var(--accent-glow) !important;
     outline: none !important;
 }
 
-.input-wrap textarea::placeholder {
-    color: var(--text-muted) !important;
-}
+.input-wrap textarea::placeholder { color: var(--green-muted) !important; }
 
 /* ── BOTONES ── */
 .btn-send {
-    background: var(--accent) !important;
-    color: #000 !important;
-    border: none !important;
-    border-radius: 10px !important;
+    background: transparent !important;
+    color: var(--accent) !important;
+    border: 1px solid var(--accent) !important;
+    border-radius: 2px !important;
     font-family: var(--font-mono) !important;
-    font-size: 13px !important;
-    font-weight: 700 !important;
-    letter-spacing: 1px !important;
-    padding: 0 28px !important;
+    font-size: 12px !important;
+    letter-spacing: 2px !important;
+    padding: 0 24px !important;
     height: 48px !important;
     cursor: pointer !important;
-    transition: all 0.2s ease !important;
+    text-shadow: 0 0 8px var(--accent) !important;
+    box-shadow: 0 0 10px rgba(0,255,65,0.1) !important;
+    transition: all 0.15s !important;
     text-transform: uppercase !important;
 }
 
 .btn-send:hover {
-    background: #33ddff !important;
+    background: var(--accent-dark) !important;
     box-shadow: 0 0 20px var(--accent-glow) !important;
-    transform: translateY(-1px) !important;
+    color: var(--green-bright) !important;
 }
 
 .btn-clear {
     background: transparent !important;
-    color: var(--text-muted) !important;
-    border: 1px solid var(--border) !important;
-    border-radius: 8px !important;
+    color: var(--green-dim) !important;
+    border: 1px solid var(--border-bright) !important;
+    border-radius: 2px !important;
     font-family: var(--font-mono) !important;
-    font-size: 11px !important;
-    letter-spacing: 1px !important;
+    font-size: 10px !important;
+    letter-spacing: 2px !important;
     cursor: pointer !important;
-    transition: all 0.2s ease !important;
+    transition: all 0.15s !important;
     text-transform: uppercase !important;
 }
 
 .btn-clear:hover {
-    border-color: var(--text-muted) !important;
-    color: var(--text-secondary) !important;
+    border-color: var(--green-dim) !important;
+    color: var(--accent) !important;
 }
 
 /* ── EJEMPLOS ── */
-.examples-wrap { margin-top: 28px; }
+.examples-wrap { margin-top: 24px; }
 
 .examples-title {
     font-family: var(--font-mono) !important;
     font-size: 10px !important;
-    color: var(--text-muted) !important;
+    color: var(--green-dim) !important;
     letter-spacing: 3px !important;
     text-transform: uppercase !important;
-    margin-bottom: 12px !important;
+    margin-bottom: 10px !important;
 }
 
-.examples-grid {
-    display: grid !important;
-    grid-template-columns: repeat(2, 1fr) !important;
-    gap: 8px !important;
-}
-
-/* Botones de ejemplos de Gradio */
 .gr-samples-table td {
     background: var(--bg-card) !important;
     border: 1px solid var(--border) !important;
-    border-radius: 8px !important;
-    color: var(--text-secondary) !important;
-    font-size: 12px !important;
-    font-family: var(--font-sans) !important;
-    padding: 10px 14px !important;
+    border-radius: 2px !important;
+    color: var(--green-dim) !important;
+    font-size: 11px !important;
+    font-family: var(--font-mono) !important;
+    padding: 8px 12px !important;
     cursor: pointer !important;
-    transition: all 0.15s ease !important;
+    transition: all 0.1s !important;
 }
 
 .gr-samples-table td:hover {
-    background: var(--bg-hover) !important;
+    background: var(--accent-dark) !important;
     border-color: var(--accent-dim) !important;
-    color: var(--text-primary) !important;
+    color: var(--accent) !important;
+    text-shadow: 0 0 6px var(--accent) !important;
 }
 
 /* ── FOOTER ── */
 .footer-wrap {
     border-top: 1px solid var(--border);
-    padding: 16px 40px;
+    padding: 14px 40px;
     display: flex;
     justify-content: space-between;
     align-items: center;
@@ -316,38 +341,37 @@ div[data-testid="bot"] p { margin: 0 0 10px !important; }
 .footer-stack {
     font-family: var(--font-mono);
     font-size: 10px;
-    color: var(--text-muted);
+    color: var(--green-muted);
     letter-spacing: 1px;
 }
 
-.footer-stack span { color: var(--accent-dim); }
+.footer-stack span { color: var(--green-dim); }
 
 .footer-author {
     font-family: var(--font-mono);
     font-size: 10px;
-    color: var(--text-muted);
+    color: var(--green-muted);
     letter-spacing: 1px;
 }
 
-/* Ocultar elementos de Gradio que no queremos */
 footer { display: none !important; }
 .built-with { display: none !important; }
-#component-0 > div.svelte-1ed2p3z { padding: 0 !important; }
 """
 
+# ── HTML estático ───────────────────────────────────────────────────
 HEADER_HTML = """
 <div class="header-wrap">
   <div class="header-top">
     <div class="status-dot"></div>
-    <div class="header-title">SUPPORT ASSISTANT RAG</div>
+    <div class="header-title">SUPPORT_ASSISTANT.RAG</div>
   </div>
-  <div class="header-sub">Customer Operations Playbook · Cristian Ursan</div>
+  <div class="header-sub">// Customer Operations Playbook · Cristian Ursan</div>
   <div class="header-meta">
     <div class="meta-chip">modelo <span>llama3.2</span></div>
-    <div class="meta-chip">GPU <span>RTX 5070 Ti</span></div>
-    <div class="meta-chip">docs <span>9 capítulos</span></div>
-    <div class="meta-chip">memoria <span>activa</span></div>
-    <div class="meta-chip">stack <span>LangChain · ChromaDB · CUDA</span></div>
+    <div class="meta-chip">GPU <span>RTX_5070_Ti</span></div>
+    <div class="meta-chip">docs <span>9_caps</span></div>
+    <div class="meta-chip">memoria <span>ON</span></div>
+    <div class="meta-chip">stream <span>ON</span></div>
   </div>
 </div>
 """
@@ -355,7 +379,7 @@ HEADER_HTML = """
 FOOTER_HTML = """
 <div class="footer-wrap">
   <div class="footer-stack">
-    <span>LangChain</span> · <span>Llama 3.2</span> · <span>ChromaDB</span> · 
+    <span>LangChain</span> · <span>Llama_3.2</span> · <span>ChromaDB</span> ·
     <span>sentence-transformers</span> · <span>CUDA</span> · <span>Gradio</span>
   </div>
   <div class="footer-author">© 2026 Cristian Ursan</div>
@@ -363,37 +387,58 @@ FOOTER_HTML = """
 """
 
 
-def chat(message: str, history: list) -> str:
+# ── Lógica de chat con streaming ───────────────────────────────────
+def chat_stream(message: str, history: list):
+    """Generador que emite tokens en tiempo real."""
     if not message.strip():
-        return "Por favor, escribe una pregunta."
+        yield history
+        return
+
+    # Añadir mensajes al historial
+    history = history + [
+        {"role": "user",      "content": message},
+        {"role": "assistant", "content": ""},
+    ]
+    yield history
+
     try:
         assistant = get_assistant()
-        result    = assistant.ask(message)
-        answer    = result["answer"]
-        sources   = result["sources"]
+        sources   = []
 
+        for token in assistant.ask_stream(message):
+            # El último yield del generador es el dict de fuentes
+            if isinstance(token, dict) and "__sources__" in token:
+                sources = token["__sources__"]
+                break
+            history[-1]["content"] += token
+            yield history
+
+        # Añadir fuentes al final de la respuesta
         if sources:
             src_list = " · ".join(f"`{s}`" for s in sorted(sources))
-            answer += f"\n\n---\n📚 **Fuentes:** {src_list}"
-
-        return answer
+            history[-1]["content"] += f"\n\n---\n📚 **Fuentes:** {src_list}"
+            yield history
 
     except FileNotFoundError:
-        return "⚠️ Playbook no indexado. Ejecuta `python src/ingest.py` primero."
+        history[-1]["content"] = "⚠️ Playbook no indexado. Ejecuta `python src/ingest.py` primero."
+        yield history
     except ConnectionError:
-        return "⚠️ Ollama no disponible. Ejecuta `ollama serve`."
+        history[-1]["content"] = "⚠️ Ollama no disponible. Ejecuta `ollama serve`."
+        yield history
     except Exception as e:
-        return f"❌ Error: {str(e)}"
+        history[-1]["content"] = f"❌ Error: {str(e)}"
+        yield history
 
 
+# ── Interfaz Gradio ─────────────────────────────────────────────────
 def build_interface() -> gr.Blocks:
     with gr.Blocks(
         title="Support Assistant RAG",
         css=CUSTOM_CSS,
         theme=gr.themes.Base(
-            primary_hue="cyan",
+            primary_hue="green",
             neutral_hue="slate",
-            font=gr.themes.GoogleFont("DM Sans"),
+            font=gr.themes.GoogleFont("Share Tech Mono"),
         ),
     ) as demo:
 
@@ -407,12 +452,11 @@ def build_interface() -> gr.Blocks:
                 show_label=False,
                 elem_classes="chatbot-wrap",
                 type="messages",
-                avatar_images=(None, "https://api.dicebear.com/7.x/bottts-neutral/svg?seed=ops"),
             )
 
             with gr.Row(elem_classes="input-wrap"):
                 msg = gr.Textbox(
-                    placeholder="Pregunta sobre Customer Operations, KPIs, escalados, SLAs, crisis...",
+                    placeholder="$ ingresa tu pregunta sobre Customer Operations...",
                     label="",
                     show_label=False,
                     scale=5,
@@ -421,7 +465,7 @@ def build_interface() -> gr.Blocks:
                     autofocus=True,
                 )
                 send_btn = gr.Button(
-                    "Enviar →",
+                    "[ EJECUTAR ]",
                     variant="primary",
                     scale=1,
                     elem_classes="btn-send",
@@ -429,13 +473,13 @@ def build_interface() -> gr.Blocks:
 
             with gr.Row():
                 clear_btn = gr.Button(
-                    "⌫  Nueva conversación",
+                    "[ CLEAR ]",
                     variant="secondary",
                     elem_classes="btn-clear",
                 )
 
             with gr.Column(elem_classes="examples-wrap"):
-                gr.HTML('<div class="examples-title">// Preguntas de ejemplo</div>')
+                gr.HTML('<div class="examples-title">// queries de ejemplo</div>')
                 gr.Examples(
                     examples=EXAMPLE_QUESTIONS,
                     inputs=msg,
@@ -444,36 +488,34 @@ def build_interface() -> gr.Blocks:
 
         gr.HTML(FOOTER_HTML)
 
-        # Lógica
+        # ── Handlers ──
         def respond(message, history):
             if not message.strip():
                 return "", history
-            reply = chat(message, history)
-            history.append({"role": "user", "content": message})
-            history.append({"role": "assistant", "content": reply})
-            return "", history
+            for updated_history in chat_stream(message, history):
+                yield "", updated_history
 
         def clear_conversation():
             try:
-                assistant = get_assistant()
-                assistant.reset_memory()
+                get_assistant().reset_memory()
             except Exception:
                 pass
             return [], ""
 
-        msg.submit(respond, [msg, chatbot], [msg, chatbot])
-        send_btn.click(respond, [msg, chatbot], [msg, chatbot])
-        clear_btn.click(clear_conversation, None, [chatbot, msg])
+        msg.submit(respond,          [msg, chatbot], [msg, chatbot])
+        send_btn.click(respond,      [msg, chatbot], [msg, chatbot])
+        clear_btn.click(clear_conversation, None,   [chatbot, msg])
 
     return demo
 
 
+# ── Entry point ─────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("\n" + "═" * 55)
-    print("  SUPPORT ASSISTANT RAG  ·  v2.0")
+    print("  SUPPORT ASSISTANT RAG  ·  v2.1")
     print("  Customer Operations Playbook · Cristian Ursan")
     print("═" * 55)
-    print("  Cargando modelo (primera vez ~30s)...\n")
+    print("  Iniciando sistema...\n")
 
     demo = build_interface()
     demo.launch(
@@ -481,5 +523,4 @@ if __name__ == "__main__":
         server_port=7860,
         share=False,
         show_error=True,
-        favicon_path=None,
     )
