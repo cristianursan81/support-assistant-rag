@@ -1,7 +1,10 @@
 """
-rag.py  ·  v2.1
+rag.py  ·  v2.2
 ---------------
-Pipeline RAG con memoria de conversación y streaming de respuestas.
+Pipeline RAG con:
+- Hybrid search (semántico + BM25)
+- Memoria de conversación
+- Streaming de respuestas
 """
 
 import os
@@ -11,6 +14,7 @@ from queue import Queue
 from threading import Thread
 from typing import Generator
 from dotenv import load_dotenv
+from langdetect import detect
 
 warnings.filterwarnings("ignore", message=".*capture().*")
 
@@ -21,14 +25,16 @@ from langchain.prompts import PromptTemplate
 from langchain.chains import ConversationalRetrievalChain
 from langchain.memory import ConversationBufferWindowMemory
 from langchain.callbacks.base import BaseCallbackHandler
+from langchain.retrievers import EnsembleRetriever
+from langchain_community.retrievers import BM25Retriever
 
 load_dotenv()
 
 CHROMA_PATH  = os.getenv("CHROMA_PATH", "./chroma_db")
 COLLECTION   = os.getenv("CHROMA_COLLECTION", "support_playbook")
-EMBED_MODEL  = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+EMBED_MODEL  = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-mpnet-base-v2")
 OLLAMA_URL   = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
 SYSTEM_PROMPT = """Eres un asistente experto en Customer Operations con más de 12 años
 de experiencia gestionando equipos internacionales en EMEA, LATAM y APAC.
@@ -37,7 +43,7 @@ Tu conocimiento proviene del playbook de operaciones documentado por Cristian Ur
 INSTRUCCIONES:
 - Usa ÚNICAMENTE la información del contexto proporcionado para responder.
 - Si la información no está en el contexto, dilo claramente sin inventar.
-- Responde siempre en español, de forma clara, estructurada y accionable.
+- Detecta el idioma de la pregunta y responde SIEMPRE en ese mismo idioma.
 - Incluye métricas, KPIs o ejemplos concretos cuando sean relevantes.
 - Si la pregunta hace referencia a algo mencionado antes en la conversación, úsalo.
 - Usa formato con bullets o numeración cuando ayude a la claridad.
@@ -84,6 +90,7 @@ class SupportAssistant:
         self._chain       = None
         self._memory      = None
         self._retriever   = None
+        self._all_docs    = None  # Para BM25
 
     def _get_device(self) -> str:
         return "cuda" if torch.cuda.is_available() else "cpu"
@@ -103,9 +110,34 @@ class SupportAssistant:
             embedding_function=self._embeddings,
         )
 
-        self._retriever = self._vectorstore.as_retriever(
+        # ── Retriever semántico (ChromaDB) ──
+        semantic_retriever = self._vectorstore.as_retriever(
             search_type="similarity",
             search_kwargs={"k": 5},
+        )
+
+        # ── Retriever BM25 (keywords) ──
+        # Cargamos todos los docs de ChromaDB para BM25
+        all_docs = self._vectorstore.get()
+        from langchain.schema import Document
+        docs_for_bm25 = [
+            Document(
+                page_content=doc,
+                metadata=meta
+            )
+            for doc, meta in zip(
+                all_docs["documents"],
+                all_docs["metadatas"]
+            )
+        ]
+
+        bm25_retriever = BM25Retriever.from_documents(docs_for_bm25)
+        bm25_retriever.k = 5
+
+        # ── Hybrid: 50% semántico + 50% BM25 ──
+        self._retriever = EnsembleRetriever(
+            retrievers=[semantic_retriever, bm25_retriever],
+            weights=[0.5, 0.5],
         )
 
         self._memory = ConversationBufferWindowMemory(
@@ -115,7 +147,6 @@ class SupportAssistant:
             return_messages=True,
         )
 
-        # LLM sin streaming para compatibilidad con la chain
         llm = OllamaLLM(
             model=OLLAMA_MODEL,
             base_url=OLLAMA_URL,
@@ -132,8 +163,9 @@ class SupportAssistant:
             verbose=False,
         )
 
-        print(f"✅ SupportAssistant v2.1 cargado ({device.upper()}, {OLLAMA_MODEL})")
-        print(f"   Streaming: activado · Memoria: 6 interacciones")
+        print(f"✅ SupportAssistant v2.2 cargado ({device.upper()}, {OLLAMA_MODEL})")
+        print(f"   Hybrid search: semántico 50% + BM25 50%")
+        print(f"   Memoria: 6 interacciones · Streaming: activado")
 
     def ask(self, question: str) -> dict:
         """Respuesta estándar sin streaming."""
@@ -147,14 +179,11 @@ class SupportAssistant:
         return {"answer": result["answer"], "sources": sources}
 
     def ask_stream(self, question: str) -> Generator:
-        """
-        Genera tokens en tiempo real.
-        Yields: str (tokens) y al final dict {"__sources__": [...]}
-        """
+        """Genera tokens en tiempo real con hybrid search."""
         if not self._retriever:
             raise RuntimeError("Ejecuta .load() primero")
 
-        # 1. Recuperar contexto relevante
+        # 1. Hybrid retrieval
         docs = self._retriever.invoke(question)
         context = "\n\n".join(doc.page_content for doc in docs)
         sources = list({
@@ -162,18 +191,24 @@ class SupportAssistant:
             for doc in docs
         })
 
-        # 2. Construir historial
+        # 2. Historial
         chat_history = ""
         if self._memory:
             for msg in self._memory.chat_memory.messages[-6:]:
                 role = "Human" if msg.type == "human" else "AI"
                 chat_history += f"{role}: {msg.content}\n"
-
-        # 3. Prompt final
+# Detectar idioma de la pregunta
+        try:
+            lang = detect(question)
+        except Exception:
+            lang = "es"
+        lang_instruction = "Respond in English." if lang == "en" else "Responde en español."
+        
+        # 3. Prompt
         prompt = QA_PROMPT.format(
             context=context,
             chat_history=chat_history,
-            question=question,
+            question=f"[{lang_instruction}] {question}",
         )
 
         # 4. LLM con streaming
@@ -208,7 +243,7 @@ class SupportAssistant:
         self._memory.chat_memory.add_user_message(question)
         self._memory.chat_memory.add_ai_message(answer)
 
-        # 7. Yield fuentes al final
+        # 7. Fuentes
         yield {"__sources__": sources}
 
     def reset_memory(self):
