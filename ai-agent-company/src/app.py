@@ -4,8 +4,8 @@ from datetime import datetime
 from sqlalchemy.orm import Session
 
 from src.database import SessionLocal, init_db
-from src.models import Agent, Company, Goal, Ticket, TicketMessage, TokenUsage
-from src.agents import run_agent_on_ticket, run_heartbeat
+from src.models import Agent, AgentEvent, Company, Goal, Ticket, TicketMessage, TokenUsage
+from src.agents import run_agent_on_ticket, run_heartbeat, auto_decompose_goal
 from src.scheduler import start_scheduler, stop_scheduler, sync_agent_schedules
 
 # ---------------------------------------------------------------------------
@@ -450,6 +450,63 @@ def trigger_heartbeat(agent_id):
 
 
 # ---------------------------------------------------------------------------
+# Activity Feed
+# ---------------------------------------------------------------------------
+
+_EVENT_ICONS = {
+    "heartbeat_start": "💓",
+    "tool_call": "🔧",
+    "delegation": "📤",
+    "goal_created": "🎯",
+    "status_change": "🔄",
+    "escalation": "🚨",
+    "decompose_start": "🧩",
+    "budget_exceeded": "💸",
+    "error": "❌",
+}
+
+
+def activity_feed(company_id, limit=50):
+    if not company_id:
+        return "Select a company."
+    db = _db()
+    try:
+        events = (
+            db.query(AgentEvent)
+            .filter(AgentEvent.company_id == int(company_id))
+            .order_by(AgentEvent.created_at.desc())
+            .limit(int(limit))
+            .all()
+        )
+        if not events:
+            return "*No agent activity yet. Run an agent to see events here.*"
+
+        lines = [f"## Activity Feed (last {len(events)} events)\n"]
+        for e in events:
+            icon = _EVENT_ICONS.get(e.event_type, "•")
+            ts = e.created_at.strftime("%m-%d %H:%M:%S")
+            agent_name = e.agent.name if e.agent else f"#{e.agent_id}"
+            ticket_ref = f" [ticket #{e.ticket_id}]" if e.ticket_id else ""
+            lines.append(
+                f"{icon} `{ts}` **{agent_name}** — {e.summary}{ticket_ref}"
+            )
+        return "\n\n".join(lines)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# Goal auto-decompose
+# ---------------------------------------------------------------------------
+
+def do_auto_decompose(goal_id, agent_id):
+    if not goal_id or not agent_id:
+        return "Select both a goal and an orchestrator agent.", ""
+    result = auto_decompose_goal(int(goal_id), int(agent_id))
+    return result, list_goals(None)  # refresh goals after decomposition
+
+
+# ---------------------------------------------------------------------------
 # Build Gradio UI
 # ---------------------------------------------------------------------------
 
@@ -591,14 +648,38 @@ def build_app():
                     gl_list_md = gr.Markdown("Select a company.")
                     gl_refresh_btn = gr.Button("Refresh", variant="secondary")
 
+                    gr.Markdown("### 🤖 Auto-Decompose")
+                    gr.Markdown(
+                        "Select a goal and an orchestrator agent (e.g. CEO). "
+                        "Claude will break the goal into sub-goals, create tasks, and delegate them."
+                    )
+                    gl_decomp_goal = gr.Dropdown(
+                        label="Goal to decompose", choices=[], interactive=True
+                    )
+                    gl_decomp_agent = gr.Dropdown(
+                        label="Orchestrator Agent", choices=[], interactive=True
+                    )
+                    gl_decomp_btn = gr.Button("🧩 Auto-Decompose Goal", variant="primary")
+                    gl_decomp_output = gr.Textbox(
+                        label="Agent Output", lines=6, interactive=False
+                    )
+
             def on_gl_company_change(company_id):
                 if not company_id:
-                    return gr.update(choices=[]), "Select a company."
+                    return (
+                        gr.update(choices=[]),
+                        gr.update(choices=[]),
+                        gr.update(choices=[]),
+                        "Select a company.",
+                    )
                 db = _db()
                 try:
                     goals = _goal_choices(db, int(company_id))
+                    agents = _agent_choices(db, int(company_id))
                     return (
                         gr.update(choices=[("— none —", None)] + goals),
+                        gr.update(choices=goals),
+                        gr.update(choices=agents),
                         list_goals(int(company_id)),
                     )
                 finally:
@@ -607,14 +688,26 @@ def build_app():
             gl_company.change(
                 on_gl_company_change,
                 inputs=gl_company,
-                outputs=[gl_parent, gl_list_md],
+                outputs=[gl_parent, gl_decomp_goal, gl_decomp_agent, gl_list_md],
             )
             gl_btn.click(
                 create_goal,
                 inputs=[gl_company, gl_title, gl_desc, gl_level, gl_parent],
                 outputs=[gl_status, gl_list_md],
+            ).then(
+                lambda c: (
+                    gr.update(choices=_goal_choices(_db(), int(c)))
+                    if c else gr.update()
+                ),
+                inputs=gl_company,
+                outputs=gl_decomp_goal,
             )
             gl_refresh_btn.click(list_goals, inputs=gl_company, outputs=gl_list_md)
+            gl_decomp_btn.click(
+                do_auto_decompose,
+                inputs=[gl_decomp_goal, gl_decomp_agent],
+                outputs=[gl_decomp_output, gl_list_md],
+            ).then(list_goals, inputs=gl_company, outputs=gl_list_md)
 
         # ── Tickets ─────────────────────────────────────────────────────────
         with gr.Tab("🎫 Tickets"):
@@ -759,19 +852,48 @@ def build_app():
             hb_company.change(on_hb_company_change, inputs=hb_company, outputs=hb_agent)
             hb_run_btn.click(trigger_heartbeat, inputs=hb_agent, outputs=hb_output)
 
+        # ── Activity Feed ────────────────────────────────────────────────────
+        with gr.Tab("🔊 Activity Feed"):
+            gr.Markdown(
+                "Live audit log of every action taken by your agents — "
+                "tool calls, delegations, goal creation, escalations, and more."
+            )
+            with gr.Row():
+                af_company = gr.Dropdown(label="Company", choices=[], interactive=True)
+                af_limit = gr.Slider(
+                    minimum=10, maximum=200, value=50, step=10,
+                    label="Events to show",
+                )
+                af_refresh_btn = gr.Button("🔄 Refresh", variant="secondary")
+            af_feed_md = gr.Markdown("Select a company.")
+
+            def on_af_company_change(company_id, limit):
+                return activity_feed(company_id, limit)
+
+            af_company.change(
+                on_af_company_change,
+                inputs=[af_company, af_limit],
+                outputs=af_feed_md,
+            )
+            af_refresh_btn.click(
+                activity_feed,
+                inputs=[af_company, af_limit],
+                outputs=af_feed_md,
+            )
+
         # ── Populate all dropdowns on load ───────────────────────────────────
         def load_all_companies():
             db = _db()
             try:
                 choices = _company_choices(db)
                 update = gr.update(choices=choices, value=choices[0][1] if choices else None)
-                return [update] * 6
+                return [update] * 7
             finally:
                 db.close()
 
         demo.load(
             load_all_companies,
-            outputs=[oc_company, gl_company, tk_company, bg_company, hb_company, co_list_md],
+            outputs=[oc_company, gl_company, tk_company, bg_company, hb_company, af_company, co_list_md],
         ).then(refresh_dashboard, outputs=dashboard_md)
 
     return demo

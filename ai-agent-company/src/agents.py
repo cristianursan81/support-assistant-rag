@@ -1,58 +1,77 @@
+"""Agent execution — agentic loop with tool use."""
 import os
 import anthropic
 from datetime import datetime
 from sqlalchemy.orm import Session
 
-from src.models import Agent, Ticket, TicketMessage, TokenUsage, Company
+from src.models import Agent, Ticket, TicketMessage, TokenUsage, Company, AgentEvent
 from src.database import SessionLocal
+from src.tools import AGENT_TOOLS, execute_tool, _log_event
 
 # claude-opus-4-6 pricing per 1M tokens
 INPUT_PRICE_PER_1M = 5.00
 OUTPUT_PRICE_PER_1M = 25.00
+MAX_TOOL_ITERATIONS = 15  # safety ceiling per run
 
 
-def calculate_cost(input_tokens: int, output_tokens: int) -> float:
+def _cost(input_tokens: int, output_tokens: int) -> float:
     return (
         input_tokens / 1_000_000 * INPUT_PRICE_PER_1M
         + output_tokens / 1_000_000 * OUTPUT_PRICE_PER_1M
     )
 
 
-def build_system_prompt(agent: Agent, company: Company) -> str:
-    boss_info = ""
-    if agent.boss:
-        boss_info = f"\nYou report to: {agent.boss.name} ({agent.boss.title})"
+def _get_client() -> anthropic.Anthropic:
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("ANTHROPIC_API_KEY not set. Add it to your .env file.")
+    return anthropic.Anthropic(api_key=api_key)
 
-    subordinate_info = ""
-    if agent.subordinates:
-        names = ", ".join(f"{s.name} ({s.title})" for s in agent.subordinates)
-        subordinate_info = f"\nYour direct reports: {names}"
 
+def _build_system(agent: Agent, company: Company) -> str:
+    boss_line = (
+        f"\nYou report to: {agent.boss.name} ({agent.boss.title})"
+        if agent.boss else "\nYou are the top of the org chart — no boss to escalate to."
+    )
+    subs = agent.subordinates
+    subs_line = (
+        "\nYour direct reports: " + ", ".join(f"{s.name} ({s.title}) #{s.id}" for s in subs)
+        if subs else "\nYou have no direct reports."
+    )
     return f"""You are {agent.name}, {agent.title} at {company.name}.
 
 Company Mission: {company.mission}
 
-Your Role: {agent.role_description or 'Handle assigned tasks efficiently and effectively.'}{boss_info}{subordinate_info}
+Your Role: {agent.role_description or 'Handle assigned tasks efficiently and effectively.'}{boss_line}{subs_line}
 
 {agent.system_prompt or ''}
 
-Work on the assigned ticket thoroughly. Provide clear, actionable output.
-When you complete a task, summarize what was accomplished and any next steps."""
+## How to work
+- Start by calling list_my_tickets to see what's pending.
+- For each ticket: read it, think, then act — delegate sub-tasks, update status, or complete the work.
+- When you finish a ticket, call update_ticket_status with status="completed" and a clear summary.
+- Delegate to direct reports when work falls under their domain. Include full context.
+- If you are stuck on something that requires a decision above your pay grade, escalate to boss.
+- Be decisive. Move work forward. Don't ask clarifying questions — make reasonable assumptions.
+"""
 
 
 def run_agent_on_ticket(agent_id: int, ticket_id: int) -> str:
-    """Run an agent on a specific ticket. Returns the agent's response."""
+    """
+    Run an agent on a specific ticket using a full agentic tool-use loop.
+    Returns the agent's final text response.
+    """
     db = SessionLocal()
     try:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
         ticket = db.query(Ticket).filter(Ticket.id == ticket_id).first()
 
-        if not agent or not ticket:
-            return "Agent or ticket not found."
-
+        if not agent:
+            return "Agent not found."
+        if not ticket:
+            return "Ticket not found."
         if not agent.is_active:
-            return f"Agent {agent.name} is not active."
-
+            return f"{agent.name} is inactive."
         if agent.spent_this_month_usd >= agent.monthly_budget_usd:
             return (
                 f"Budget exceeded: ${agent.spent_this_month_usd:.4f}"
@@ -60,79 +79,121 @@ def run_agent_on_ticket(agent_id: int, ticket_id: int) -> str:
             )
 
         company = db.query(Company).filter(Company.id == agent.company_id).first()
-        system = build_system_prompt(agent, company)
+        system = _build_system(agent, company)
+        client = _get_client()
 
-        # Build conversation from ticket message history
-        messages = []
-        for msg in ticket.messages:
-            if msg.role in ("user", "assistant"):
-                messages.append({"role": msg.role, "content": msg.content})
+        # Seed the conversation from the ticket
+        history = []
+        for m in ticket.messages:
+            if m.role in ("user", "assistant"):
+                history.append({"role": m.role, "content": m.content})
 
-        # If no prior messages, seed from ticket description
-        if not messages:
-            messages = [{
+        if not history:
+            history = [{
                 "role": "user",
                 "content": (
-                    f"Please work on this task:\n\n"
-                    f"Title: {ticket.title}\n\n"
-                    f"Description: {ticket.description or 'No description provided.'}"
-                )
+                    f"You have been assigned a ticket.\n\n"
+                    f"Ticket #{ticket.id}: {ticket.title}\n\n"
+                    f"{ticket.description or 'No description provided.'}\n\n"
+                    "Please work on this now."
+                ),
             }]
 
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            return "ANTHROPIC_API_KEY not set. Please configure your .env file."
+        _log_event(db, agent, "heartbeat_start",
+                   f"Started working on ticket #{ticket.id}: {ticket.title}", ticket.id)
+        db.commit()
 
-        client = anthropic.Anthropic(api_key=api_key)
+        total_input_tokens = 0
+        total_output_tokens = 0
+        final_text = ""
+        iterations = 0
 
-        with client.messages.stream(
-            model="claude-opus-4-6",
-            max_tokens=4096,
-            thinking={"type": "adaptive"},
-            system=system,
-            messages=messages,
-        ) as stream:
-            response = stream.get_final_message()
+        # ── Agentic tool-use loop ────────────────────────────────────────
+        while iterations < MAX_TOOL_ITERATIONS:
+            iterations += 1
 
-        response_text = next(
-            (b.text for b in response.content if b.type == "text"), ""
-        )
+            response = client.messages.create(
+                model="claude-opus-4-6",
+                max_tokens=4096,
+                thinking={"type": "adaptive"},
+                system=system,
+                tools=AGENT_TOOLS,
+                messages=history,
+            )
 
-        # Record token usage
-        usage = response.usage
-        cost = calculate_cost(usage.input_tokens, usage.output_tokens)
+            total_input_tokens += response.usage.input_tokens
+            total_output_tokens += response.usage.output_tokens
 
+            # Append full response (preserves thinking blocks for next turn)
+            history.append({"role": "assistant", "content": response.content})
+
+            # Collect text from this turn
+            turn_text = " ".join(
+                b.text for b in response.content if b.type == "text"
+            )
+            if turn_text:
+                final_text = turn_text  # keep the last meaningful text
+
+            if response.stop_reason == "end_turn":
+                break
+
+            if response.stop_reason == "tool_use":
+                tool_results = []
+                for block in response.content:
+                    if block.type != "tool_use":
+                        continue
+
+                    _log_event(db, agent, "tool_call",
+                               f"Called {block.name}({block.input})", ticket.id)
+                    db.commit()
+
+                    result = execute_tool(
+                        block.name, block.input, agent, ticket, db
+                    )
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+
+                history.append({"role": "user", "content": tool_results})
+                continue
+
+            # max_tokens or other stop reason — bail out
+            break
+
+        # ── Persist usage & final message ───────────────────────────────
+        cost = _cost(total_input_tokens, total_output_tokens)
         db.add(TokenUsage(
             agent_id=agent.id,
             ticket_id=ticket.id,
-            input_tokens=usage.input_tokens,
-            output_tokens=usage.output_tokens,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
             cost_usd=cost,
         ))
-
-        # Update agent spending and heartbeat
         agent.spent_this_month_usd += cost
         agent.last_heartbeat = datetime.utcnow()
 
-        # Save agent response as ticket message
-        db.add(TicketMessage(
-            ticket_id=ticket.id,
-            role="assistant",
-            content=response_text,
-        ))
+        if final_text:
+            db.add(TicketMessage(
+                ticket_id=ticket.id,
+                role="assistant",
+                content=final_text,
+            ))
 
-        # Advance ticket status
         if ticket.status == "open":
             ticket.status = "in_progress"
         ticket.updated_at = datetime.utcnow()
 
         db.commit()
-        return response_text
+        return final_text or "(Agent completed work using tools — see ticket for details.)"
 
     except anthropic.AuthenticationError:
-        return "Invalid ANTHROPIC_API_KEY. Check your .env file."
+        return "Invalid ANTHROPIC_API_KEY."
     except anthropic.RateLimitError:
-        return "Rate limit reached. Please wait and try again."
+        return "Rate limit hit. Please wait and retry."
+    except RuntimeError as e:
+        return str(e)
     except Exception as e:
         db.rollback()
         return f"Error: {e}"
@@ -141,7 +202,10 @@ def run_agent_on_ticket(agent_id: int, ticket_id: int) -> str:
 
 
 def run_heartbeat(agent_id: int) -> str:
-    """Heartbeat: agent wakes up, processes its pending tickets."""
+    """
+    Agent heartbeat: wake up, process all pending tickets.
+    Returns a summary of what was done.
+    """
     db = SessionLocal()
     try:
         agent = db.query(Agent).filter(
@@ -150,7 +214,6 @@ def run_heartbeat(agent_id: int) -> str:
 
         if not agent:
             return "Agent not found or inactive."
-
         if agent.spent_this_month_usd >= agent.monthly_budget_usd:
             return (
                 f"{agent.name} budget exhausted:"
@@ -170,24 +233,82 @@ def run_heartbeat(agent_id: int) -> str:
         if not open_tickets:
             agent.last_heartbeat = datetime.utcnow()
             db.commit()
-            return f"{agent.name} heartbeat: no pending tickets — idle."
+            return f"{agent.name}: no pending tickets — idle."
 
         ticket_ids = [t.id for t in open_tickets]
+    finally:
         db.close()
 
-        results = []
-        for tid in ticket_ids:
-            result = run_agent_on_ticket(agent_id, tid)
-            results.append(f"  • Ticket #{tid}: processed")
+    results = []
+    for tid in ticket_ids:
+        result = run_agent_on_ticket(agent_id, tid)
+        snippet = result[:120].replace("\n", " ")
+        results.append(f"  • Ticket #{tid}: {snippet}{'...' if len(result) > 120 else ''}")
 
-        return (
-            f"{agent.name} heartbeat complete.\n"
-            + "\n".join(results)
+    return f"{agent.name} heartbeat — processed {len(results)} ticket(s):\n" + "\n".join(results)
+
+
+def auto_decompose_goal(goal_id: int, orchestrator_agent_id: int) -> str:
+    """
+    Ask the orchestrator agent to decompose a goal into sub-goals/tasks
+    and delegate them to appropriate direct reports.
+    """
+    db = SessionLocal()
+    try:
+        from src.models import Goal
+        goal = db.query(Goal).filter(Goal.id == goal_id).first()
+        agent = db.query(Agent).filter(Agent.id == orchestrator_agent_id).first()
+
+        if not goal:
+            return "Goal not found."
+        if not agent:
+            return "Orchestrator agent not found."
+
+        company = db.query(Company).filter(Company.id == agent.company_id).first()
+        subs = agent.subordinates
+        subs_desc = (
+            "\n".join(f"  - {s.name} ({s.title}) #{s.id}: {s.role_description or 'no description'}"
+                      for s in subs)
+            if subs else "  (no direct reports)"
         )
-    except Exception as e:
-        return f"Heartbeat error: {e}"
+
+        system = _build_system(agent, company)
+        client = _get_client()
+
+        prompt = (
+            f"You have been asked to decompose and delegate the following company goal:\n\n"
+            f"Goal #{goal.id}: {goal.title}\n"
+            f"Level: {goal.level}\n"
+            f"Description: {goal.description or 'No description.'}\n\n"
+            f"Your direct reports and their domains:\n{subs_desc}\n\n"
+            "Please:\n"
+            "1. Use create_subgoal to break this into 2-5 sub-goals or tasks.\n"
+            "2. For each task, use delegate_task to assign it to the most suitable direct report.\n"
+            "3. Summarize what you've set up and why.\n\n"
+            "Be concrete and decisive. Do it now."
+        )
+
+        history = [{"role": "user", "content": prompt}]
+
+        # Create a synthetic ticket so tools have context
+        synth_ticket = Ticket(
+            company_id=agent.company_id,
+            agent_id=agent.id,
+            title=f"[Auto-decompose] {goal.title}",
+            description=prompt,
+            goal_id=goal.id,
+            status="in_progress",
+        )
+        db.add(synth_ticket)
+        db.flush()
+
+        _log_event(db, agent, "decompose_start",
+                   f"Auto-decomposing goal #{goal.id}: {goal.title}", synth_ticket.id)
+        db.commit()
+
     finally:
-        try:
-            db.close()
-        except Exception:
-            pass
+        db.close()
+
+    # Run the agentic loop for decomposition (reuses run_agent_on_ticket logic)
+    result = run_agent_on_ticket(orchestrator_agent_id, synth_ticket.id)
+    return result

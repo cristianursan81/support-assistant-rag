@@ -108,3 +108,21 @@ class TokenUsage(Base):
 
     agent = relationship("Agent", back_populates="token_usages")
     ticket = relationship("Ticket", back_populates="token_usages")
+
+
+class AgentEvent(Base):
+    """Audit log of every action an agent takes."""
+    __tablename__ = "agent_events"
+
+    id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=False)
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=True)
+    event_type = Column(String, nullable=False)
+    # e.g. heartbeat_start | tool_call | delegation | goal_created
+    # | status_change | escalation | budget_exceeded | error
+    summary = Column(Text, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    agent = relationship("Agent")
+    ticket = relationship("Ticket")
