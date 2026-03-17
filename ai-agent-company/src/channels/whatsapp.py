@@ -5,10 +5,13 @@ from twilio.request_validator import RequestValidator
 
 
 def _client() -> Client:
-    return Client(
-        os.environ["TWILIO_ACCOUNT_SID"],
-        os.environ["TWILIO_AUTH_TOKEN"],
-    )
+    sid = os.getenv("TWILIO_ACCOUNT_SID", "")
+    token = os.getenv("TWILIO_AUTH_TOKEN", "")
+    if not sid or not token:
+        raise RuntimeError(
+            "TWILIO_ACCOUNT_SID y TWILIO_AUTH_TOKEN deben estar configurados en .env"
+        )
+    return Client(sid, token)
 
 
 def send_whatsapp(to_phone: str, message: str) -> bool:

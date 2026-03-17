@@ -1,7 +1,8 @@
 """AI Agent Company — Gradio Dashboard"""
 import gradio as gr
 from datetime import datetime
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload
 
 from src.database import SessionLocal, init_db
 from src.models import Agent, AgentEvent, Company, Goal, Ticket, TicketMessage, TokenUsage
@@ -247,6 +248,7 @@ def list_tickets(company_id):
     try:
         tickets = (
             db.query(Ticket)
+            .options(joinedload(Ticket.assigned_agent))
             .filter(Ticket.company_id == int(company_id))
             .order_by(Ticket.id.desc())
             .all()
@@ -416,11 +418,15 @@ def refresh_dashboard():
         companies = db.query(Company).count()
         agents = db.query(Agent).filter(Agent.is_active == True).count()  # noqa: E712
         open_tickets = db.query(Ticket).filter(Ticket.status.in_(["open", "in_progress"])).count()
-        total_spent = db.query(TokenUsage).all()
-        total_cost = sum(u.cost_usd for u in total_spent)
+        # Use aggregate — avoids loading every row into RAM
+        total_cost = db.query(func.sum(TokenUsage.cost_usd)).scalar() or 0.0
 
         recent_tickets = (
-            db.query(Ticket).order_by(Ticket.updated_at.desc()).limit(5).all()
+            db.query(Ticket)
+            .options(joinedload(Ticket.assigned_agent))
+            .order_by(Ticket.updated_at.desc())
+            .limit(5)
+            .all()
         )
         recent_lines = []
         for t in recent_tickets:
@@ -473,6 +479,7 @@ def activity_feed(company_id, limit=50):
     try:
         events = (
             db.query(AgentEvent)
+            .options(joinedload(AgentEvent.agent))
             .filter(AgentEvent.company_id == int(company_id))
             .order_by(AgentEvent.created_at.desc())
             .limit(int(limit))
@@ -499,21 +506,22 @@ def activity_feed(company_id, limit=50):
 # Goal auto-decompose
 # ---------------------------------------------------------------------------
 
-def do_auto_decompose(goal_id, agent_id):
+def do_auto_decompose(goal_id, agent_id, company_id):
     if not goal_id or not agent_id:
         return "Select both a goal and an orchestrator agent.", ""
     result = auto_decompose_goal(int(goal_id), int(agent_id))
-    return result, list_goals(None)  # refresh goals after decomposition
+    return result, list_goals(company_id)
 
 
 # ---------------------------------------------------------------------------
 # Setup Wizard (GestorIA)
 # ---------------------------------------------------------------------------
 
-def setup_wizard_apply(industry, business_info_json, whatsapp_number, email_address):
-    """Apply an industry template to a new or existing workspace."""
-    from src.templates.loader import load_template, create_workspace, PLAN_LIMITS
+def setup_wizard_apply(workspace_id, industry, business_info_json, whatsapp_number, email_address):
+    """Apply an industry template to an explicitly selected workspace."""
+    from src.templates.loader import load_template
     from src.models import Workspace
+    from datetime import timezone
     import json as _json
 
     if not industry:
@@ -522,21 +530,29 @@ def setup_wizard_apply(industry, business_info_json, whatsapp_number, email_addr
     try:
         info = _json.loads(business_info_json) if business_info_json.strip() else {}
     except Exception:
-        return "El JSON de información del negocio no es válido."
+        return "El JSON de información del negocio no es válido. Verifica la sintaxis."
 
     db = _db()
     try:
-        # Find or create workspace
-        ws = db.query(Workspace).first()
-        if not ws:
+        # Use the explicitly selected workspace — never .first()
+        if workspace_id:
+            ws = db.query(Workspace).filter(Workspace.id == int(workspace_id)).first()
+        else:
+            # No workspaces exist yet — create a demo one
+            from src.templates.loader import PLAN_LIMITS
+            from datetime import timedelta
             ws = Workspace(
                 name=info.get("nombre", "Mi Negocio"),
                 industry=industry,
                 plan="trial",
-                monthly_message_limit=100,
+                monthly_message_limit=PLAN_LIMITS["trial"],
+                trial_ends_at=datetime.now(timezone.utc) + timedelta(days=14),
             )
             db.add(ws)
             db.flush()
+
+        if not ws:
+            return "Workspace no encontrado. Crea una cuenta primero."
 
         if whatsapp_number.strip():
             ws.whatsapp_number = whatsapp_number.strip()
@@ -551,6 +567,17 @@ def setup_wizard_apply(industry, business_info_json, whatsapp_number, email_addr
     from src.scheduler import sync_agent_schedules
     sync_agent_schedules()
     return result
+
+
+def _workspace_choices():
+    """Return (label, id) list of all workspaces for the wizard selector."""
+    from src.models import Workspace
+    db = _db()
+    try:
+        workspaces = db.query(Workspace).order_by(Workspace.id).all()
+        return [(f"{ws.name} (#{ws.id}) [{ws.plan}]", ws.id) for ws in workspaces]
+    finally:
+        db.close()
 
 
 def get_template_fields_md(industry):
@@ -795,7 +822,7 @@ def build_app():
             gl_refresh_btn.click(list_goals, inputs=gl_company, outputs=gl_list_md)
             gl_decomp_btn.click(
                 do_auto_decompose,
-                inputs=[gl_decomp_goal, gl_decomp_agent],
+                inputs=[gl_decomp_goal, gl_decomp_agent, gl_company],
                 outputs=[gl_decomp_output, gl_list_md],
             ).then(list_goals, inputs=gl_company, outputs=gl_list_md)
 
@@ -987,6 +1014,17 @@ def build_app():
                 "Configura tu equipo de IA en 4 pasos. "
                 "El sistema creará los agentes y los pondrá a trabajar automáticamente."
             )
+
+            gr.Markdown("### 0️⃣ Workspace")
+            wz_workspace = gr.Dropdown(
+                label="Selecciona tu workspace",
+                choices=_workspace_choices(),
+                interactive=True,
+                info="Si acabas de registrarte, tu workspace aparece aquí. Si está vacío, primero crea una cuenta vía /api/auth/register.",
+            )
+            wz_ws_refresh = gr.Button("🔄 Actualizar lista", variant="secondary", size="sm")
+            wz_ws_refresh.click(_workspace_choices, outputs=wz_workspace)
+
             with gr.Row():
                 with gr.Column():
                     gr.Markdown("### 1️⃣ Sector de tu negocio")
@@ -1038,7 +1076,7 @@ def build_app():
 
             wz_activate_btn.click(
                 setup_wizard_apply,
-                inputs=[wz_industry, wz_info_json, wz_whatsapp, wz_email],
+                inputs=[wz_workspace, wz_industry, wz_info_json, wz_whatsapp, wz_email],
                 outputs=wz_result,
             ).then(refresh_dashboard, outputs=dashboard_md)
 
@@ -1047,8 +1085,10 @@ def build_app():
             db = _db()
             try:
                 choices = _company_choices(db)
-                update = gr.update(choices=choices, value=choices[0][1] if choices else None)
-                return [update] * 7
+                dd_update = gr.update(choices=choices, value=choices[0][1] if choices else None)
+                # co_list_md is Markdown — return its content, not a dropdown update
+                companies_text = list_companies()
+                return dd_update, dd_update, dd_update, dd_update, dd_update, dd_update, companies_text
             finally:
                 db.close()
 

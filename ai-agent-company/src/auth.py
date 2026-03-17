@@ -92,6 +92,8 @@ def authenticate_user(email: str, password: str, db):
 
 def register_user(email: str, password: str, full_name: str, workspace_id: int, db):
     from src.models import User
+    if len(password) < 8:
+        raise ValueError("La contraseña debe tener mínimo 8 caracteres.")
     if get_user_by_email(email, db):
         raise ValueError("Este email ya está registrado.")
     user = User(

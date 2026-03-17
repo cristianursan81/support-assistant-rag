@@ -1,21 +1,70 @@
 """FastAPI app — WhatsApp webhook, email webhook, REST API, auth."""
 import os
-from datetime import datetime
+import time
+import threading
+from collections import defaultdict
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import FastAPI, Request, HTTPException, Depends, Form, Header
+from fastapi import FastAPI, Request, HTTPException, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse, JSONResponse
 from pydantic import BaseModel
 
 from src.database import SessionLocal, init_db
-from src.models import Workspace, User, Conversation, Ticket, TicketMessage
-from src.auth import authenticate_user, register_user, create_access_token, decode_token
-from src.agents import run_agent_on_ticket
+from src.models import Workspace, User, Conversation, Ticket, TicketMessage, Agent
+from src.auth import authenticate_user, create_access_token, decode_token, hash_password
+from src.agents import run_agent_on_ticket, MODEL_CUSTOMER
 from src.scheduler import sync_agent_schedules
 from src.channels.whatsapp import parse_inbound, validate_twilio_signature
-from src.templates.loader import load_template, create_workspace, get_template_fields
+from src.templates.loader import load_template, PLAN_LIMITS, get_template_fields
 
-app = FastAPI(title="GestorIA API", version="1.0.0")
+
+# ---------------------------------------------------------------------------
+# Simple in-process rate limiter for auth endpoints
+# ---------------------------------------------------------------------------
+
+_login_attempts: dict[str, list[float]] = defaultdict(list)
+_login_lock = threading.Lock()
+_RATE_WINDOW = 300   # 5 minutes
+_RATE_MAX = 10       # max attempts per window per IP
+
+
+def _check_rate_limit(ip: str):
+    now = time.time()
+    with _login_lock:
+        attempts = [t for t in _login_attempts[ip] if now - t < _RATE_WINDOW]
+        attempts.append(now)
+        _login_attempts[ip] = attempts
+        if len(attempts) > _RATE_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Demasiados intentos. Espera 5 minutos.",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (replaces deprecated @app.on_event)
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
+
+app = FastAPI(title="GestorIA API", version="1.1.0", lifespan=lifespan)
+
+# CORS — tighten origins in production via ALLOWED_ORIGINS env var
+_origins = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ---------------------------------------------------------------------------
@@ -65,7 +114,9 @@ class RegisterRequest(BaseModel):
 
 
 @app.post("/api/auth/login")
-def login(body: LoginRequest, db=Depends(get_db)):
+def login(body: LoginRequest, request: Request, db=Depends(get_db)):
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
     user = authenticate_user(body.email, body.password, db)
     if not user:
         raise HTTPException(status_code=401, detail="Email o contraseña incorrectos")
@@ -75,17 +126,45 @@ def login(body: LoginRequest, db=Depends(get_db)):
 
 @app.post("/api/auth/register")
 def register(body: RegisterRequest, db=Depends(get_db)):
-    ws = create_workspace(body.workspace_name, body.industry, plan="trial")
-    try:
-        user = register_user(body.email, body.password, body.full_name, ws.id, db)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    """Register a new SME customer. Creates Workspace + User in one transaction."""
+    if len(body.password) < 8:
+        raise HTTPException(status_code=400, detail="La contraseña debe tener mínimo 8 caracteres.")
+
+    # Check email not already taken
+    existing = db.query(User).filter(User.email == body.email.lower()).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="Este email ya está registrado.")
+
+    # Create Workspace + User atomically in the same DB session
+    trial_ends = datetime.now(timezone.utc) + timedelta(days=14)
+    ws = Workspace(
+        name=body.workspace_name,
+        industry=body.industry,
+        plan="trial",
+        monthly_message_limit=PLAN_LIMITS["trial"],
+        trial_ends_at=trial_ends,
+    )
+    db.add(ws)
+    db.flush()  # get ws.id without committing
+
+    user = User(
+        workspace_id=ws.id,
+        email=body.email.lower(),
+        hashed_password=hash_password(body.password),
+        full_name=body.full_name,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+
     token = create_access_token(user.id, ws.id)
     return {
         "access_token": token,
         "token_type": "bearer",
         "workspace_id": ws.id,
-        "message": "Cuenta creada. Completa el asistente de configuración.",
+        "trial_ends_at": trial_ends.isoformat(),
+        "message": "Cuenta creada. Tienes 14 días de prueba gratuita. Completa el asistente de configuración.",
     }
 
 
@@ -127,6 +206,7 @@ def workspace_info(user: User = Depends(current_user), db=Depends(get_db)):
         "messages_used": ws.messages_used_this_month,
         "message_limit": ws.monthly_message_limit,
         "whatsapp_number": ws.whatsapp_number,
+        "trial_ends_at": ws.trial_ends_at.isoformat() if ws.trial_ends_at else None,
     }
 
 
@@ -138,11 +218,12 @@ def workspace_info(user: User = Depends(current_user), db=Depends(get_db)):
 async def whatsapp_webhook(request: Request, db=Depends(get_db)):
     """
     Receives inbound WhatsApp messages from Twilio.
-    Creates a Ticket and triggers the agent immediately.
+    Creates a Ticket and triggers the agent immediately in a background thread.
+    Must return quickly (<5 s) to satisfy Twilio's webhook timeout.
     """
     form = dict(await request.form())
 
-    # Validate Twilio signature (skip in dev if env var not set)
+    # Validate Twilio signature (skip if env var not set — dev only)
     twilio_sig = request.headers.get("X-Twilio-Signature", "")
     base_url = os.getenv("BASE_URL", str(request.url))
     if os.getenv("TWILIO_AUTH_TOKEN"):
@@ -158,25 +239,26 @@ async def whatsapp_webhook(request: Request, db=Depends(get_db)):
     body = msg["body"]
     profile_name = msg.get("profile_name", "")
 
-    # Find workspace by WhatsApp number
-    ws = (
-        db.query(Workspace)
-        .filter(Workspace.whatsapp_number == to_phone)
-        .first()
-    )
+    # Find workspace by WhatsApp number (indexed column — fast)
+    ws = db.query(Workspace).filter(Workspace.whatsapp_number == to_phone).first()
     if not ws:
-        # Fallback: find by partial match
+        # Fallback: partial match (in case user stored number without country prefix)
         ws = db.query(Workspace).filter(
             Workspace.whatsapp_number.like(f"%{to_phone[-9:]}")
         ).first()
     if not ws or not ws.company_id:
-        return "ok"  # no workspace configured for this number
+        return "ok"
 
-    # Check message limit
+    # Enforce message quota
     if ws.messages_used_this_month >= ws.monthly_message_limit:
-        return "ok"  # quota exceeded — silently drop (or send upgrade notice)
+        # Inform customer instead of silently dropping
+        from src.channels.whatsapp import send_whatsapp as _send
+        _send(from_phone,
+              "Lo sentimos, hemos alcanzado el límite mensual de mensajes. "
+              "Contacta con nosotros por teléfono.")
+        return "ok"
 
-    # Find or create Conversation
+    # Find or continue active conversation (uses composite index)
     conv = (
         db.query(Conversation)
         .filter(
@@ -188,18 +270,13 @@ async def whatsapp_webhook(request: Request, db=Depends(get_db)):
         .first()
     )
 
+    ticket = None
     if conv and conv.ticket_id:
-        # Continue existing conversation
         ticket = db.query(Ticket).filter(Ticket.id == conv.ticket_id).first()
         if ticket and ticket.status in ("completed", "blocked"):
-            ticket = None  # start fresh if previous was closed
-
-    else:
-        ticket = None
+            ticket = None  # start a fresh thread
 
     if not ticket:
-        # Find the primary customer-facing agent for this workspace
-        from src.models import Agent
         agent = (
             db.query(Agent)
             .filter(Agent.company_id == ws.company_id, Agent.boss_id == None)  # noqa: E711
@@ -234,30 +311,25 @@ async def whatsapp_webhook(request: Request, db=Depends(get_db)):
         else:
             conv.ticket_id = ticket.id
 
-    # Add customer message to ticket thread
+    # Append customer message
     db.add(TicketMessage(ticket_id=ticket.id, role="user", content=body))
-
-    # Increment usage counter
     ws.messages_used_this_month += 1
     conv.last_message_at = datetime.utcnow()
-
     db.commit()
 
-    # Run agent asynchronously (fire-and-forget in a background thread)
-    import threading
+    # Fire-and-forget agent run — use Haiku for speed + cost
     ticket_id = ticket.id
     agent_id = ticket.agent_id
 
     def _run():
-        run_agent_on_ticket(agent_id, ticket_id)
+        run_agent_on_ticket(agent_id, ticket_id, model=MODEL_CUSTOMER)
 
     threading.Thread(target=_run, daemon=True).start()
-
     return "ok"
 
 
 # ---------------------------------------------------------------------------
-# Email webhook (simple HTTP POST from email forwarding service)
+# Email webhook
 # ---------------------------------------------------------------------------
 
 class EmailWebhookBody(BaseModel):
@@ -270,9 +342,7 @@ class EmailWebhookBody(BaseModel):
 
 @app.post("/api/webhook/email")
 def email_webhook(payload: EmailWebhookBody, db=Depends(get_db)):
-    """
-    Receives inbound emails (e.g. from SendGrid inbound parse or Mailgun).
-    """
+    """Receives inbound emails from SendGrid / Mailgun inbound parse."""
     ws = db.query(Workspace).filter(Workspace.email == payload.to_email).first()
     if not ws or not ws.company_id:
         return {"status": "no workspace"}
@@ -280,7 +350,6 @@ def email_webhook(payload: EmailWebhookBody, db=Depends(get_db)):
     if ws.messages_used_this_month >= ws.monthly_message_limit:
         return {"status": "quota exceeded"}
 
-    from src.models import Agent
     agent = (
         db.query(Agent)
         .filter(Agent.company_id == ws.company_id, Agent.boss_id == None)  # noqa: E711
@@ -301,7 +370,6 @@ def email_webhook(payload: EmailWebhookBody, db=Depends(get_db)):
     )
     db.add(ticket)
     db.flush()
-
     db.add(TicketMessage(ticket_id=ticket.id, role="user", content=payload.body))
 
     conv = Conversation(
@@ -315,11 +383,10 @@ def email_webhook(payload: EmailWebhookBody, db=Depends(get_db)):
     ws.messages_used_this_month += 1
     db.commit()
 
-    import threading
     tid, aid = ticket.id, agent.id
 
     def _run():
-        run_agent_on_ticket(aid, tid)
+        run_agent_on_ticket(aid, tid, model=MODEL_CUSTOMER)
 
     threading.Thread(target=_run, daemon=True).start()
     return {"status": "processing"}
@@ -330,14 +397,10 @@ def email_webhook(payload: EmailWebhookBody, db=Depends(get_db)):
 # ---------------------------------------------------------------------------
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "service": "GestorIA"}
-
-
-# ---------------------------------------------------------------------------
-# Init on startup
-# ---------------------------------------------------------------------------
-
-@app.on_event("startup")
-def on_startup():
-    init_db()
+def health(db=Depends(get_db)):
+    try:
+        db.execute(__import__("sqlalchemy").text("SELECT 1"))
+        db_ok = True
+    except Exception:
+        db_ok = False
+    return {"status": "ok", "service": "GestorIA", "db": db_ok}

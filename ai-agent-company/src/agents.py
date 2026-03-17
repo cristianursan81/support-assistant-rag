@@ -8,16 +8,26 @@ from src.models import Agent, Ticket, TicketMessage, TokenUsage, Company, AgentE
 from src.database import SessionLocal
 from src.tools import AGENT_TOOLS, execute_tool, _log_event
 
-# claude-opus-4-6 pricing per 1M tokens
-INPUT_PRICE_PER_1M = 5.00
-OUTPUT_PRICE_PER_1M = 25.00
-MAX_TOOL_ITERATIONS = 15  # safety ceiling per run
+# Model selection:
+#   - Customer-facing tickets (WhatsApp/email replies): Haiku — fast + cheap
+#   - Orchestration / auto-decompose: Sonnet — smarter planning
+MODEL_CUSTOMER = "claude-haiku-4-5-20251001"   # ~20x cheaper than Opus
+MODEL_ORCHESTRATOR = "claude-sonnet-4-6"        # used only for auto_decompose
+
+# Pricing per 1M tokens (approximate, update if Anthropic changes rates)
+_PRICES = {
+    "claude-haiku-4-5-20251001":  (0.80,  4.00),   # input, output
+    "claude-sonnet-4-6":          (3.00, 15.00),
+    "claude-opus-4-6":            (15.0, 75.00),
+}
+MAX_TOOL_ITERATIONS = 8   # hard cap per run (customer replies rarely need >4)
 
 
-def _cost(input_tokens: int, output_tokens: int) -> float:
+def _cost(input_tokens: int, output_tokens: int, model: str) -> float:
+    inp_price, out_price = _PRICES.get(model, (3.00, 15.00))
     return (
-        input_tokens / 1_000_000 * INPUT_PRICE_PER_1M
-        + output_tokens / 1_000_000 * OUTPUT_PRICE_PER_1M
+        input_tokens / 1_000_000 * inp_price
+        + output_tokens / 1_000_000 * out_price
     )
 
 
@@ -56,10 +66,17 @@ Your Role: {agent.role_description or 'Handle assigned tasks efficiently and eff
 """
 
 
-def run_agent_on_ticket(agent_id: int, ticket_id: int) -> str:
+def run_agent_on_ticket(
+    agent_id: int,
+    ticket_id: int,
+    model: str = MODEL_CUSTOMER,
+) -> str:
     """
     Run an agent on a specific ticket using a full agentic tool-use loop.
     Returns the agent's final text response.
+
+    model: which Claude model to use. Default is Haiku (cheap, fast).
+           Pass MODEL_ORCHESTRATOR for complex orchestration tasks.
     """
     db = SessionLocal()
     try:
@@ -108,18 +125,24 @@ def run_agent_on_ticket(agent_id: int, ticket_id: int) -> str:
         final_text = ""
         iterations = 0
 
+        # Extended thinking only for models that support it (not Haiku)
+        use_thinking = model not in (MODEL_CUSTOMER,)
+
         # ── Agentic tool-use loop ────────────────────────────────────────
         while iterations < MAX_TOOL_ITERATIONS:
             iterations += 1
 
-            response = client.messages.create(
-                model="claude-opus-4-6",
-                max_tokens=4096,
-                thinking={"type": "adaptive"},
+            create_kwargs = dict(
+                model=model,
+                max_tokens=2048,
                 system=system,
                 tools=AGENT_TOOLS,
                 messages=history,
             )
+            if use_thinking:
+                create_kwargs["thinking"] = {"type": "adaptive"}
+
+            response = client.messages.create(**create_kwargs)
 
             total_input_tokens += response.usage.input_tokens
             total_output_tokens += response.usage.output_tokens
@@ -163,7 +186,7 @@ def run_agent_on_ticket(agent_id: int, ticket_id: int) -> str:
             break
 
         # ── Persist usage & final message ───────────────────────────────
-        cost = _cost(total_input_tokens, total_output_tokens)
+        cost = _cost(total_input_tokens, total_output_tokens, model)
         db.add(TokenUsage(
             agent_id=agent.id,
             ticket_id=ticket.id,
@@ -309,6 +332,6 @@ def auto_decompose_goal(goal_id: int, orchestrator_agent_id: int) -> str:
     finally:
         db.close()
 
-    # Run the agentic loop for decomposition (reuses run_agent_on_ticket logic)
-    result = run_agent_on_ticket(orchestrator_agent_id, synth_ticket.id)
+    # Run the agentic loop for decomposition — use smarter model for planning
+    result = run_agent_on_ticket(orchestrator_agent_id, synth_ticket.id, model=MODEL_ORCHESTRATOR)
     return result

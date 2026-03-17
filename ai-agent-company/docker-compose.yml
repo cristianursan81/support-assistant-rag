@@ -1,0 +1,36 @@
+version: "3.9"
+
+# GestorIA — single-VPS deployment (Hetzner CX11 / Contabo S / any 2vCPU 4GB VPS)
+# Runs comfortably on 1 vCPU, 512 MB RAM for up to 50 active tenants.
+#
+# Usage:
+#   cp .env.example .env && nano .env   # fill in API keys
+#   docker compose up -d
+#   docker compose logs -f gestor       # follow logs
+#
+# Ports exposed:
+#   7861 → Gradio operator dashboard
+#   8000 → FastAPI (webhooks + REST API)
+#
+# For HTTPS / custom domain: put Caddy or Nginx in front.
+# For Twilio webhooks: set BASE_URL=https://yourdomain.com in .env
+
+services:
+  gestor:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "7861:7861"
+    env_file:
+      - .env
+    volumes:
+      - gestor_data:/app/data
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+          cpus: "1.5"
+
+volumes:
+  gestor_data:

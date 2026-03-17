@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Float, Boolean,
-    DateTime, ForeignKey, Text, JSON
+    DateTime, ForeignKey, Text, JSON, Index
 )
 from sqlalchemy.orm import relationship
 from src.database import Base
@@ -143,8 +143,8 @@ class Workspace(Base):
     # restaurante | clinica | tienda | custom
 
     # Contact / channel config
-    whatsapp_number = Column(String, nullable=True)   # E.164 e.g. +34612345678
-    email = Column(String, nullable=True)
+    whatsapp_number = Column(String, nullable=True, index=True)   # E.164 e.g. +34612345678
+    email = Column(String, nullable=True, index=True)
     phone = Column(String, nullable=True)
 
     # Business info fed to agents via get_business_info()
@@ -201,6 +201,12 @@ class Conversation(Base):
     workspace = relationship("Workspace", back_populates="conversations")
     ticket = relationship("Ticket")
 
+    __table_args__ = (
+        # Fast lookup for inbound message deduplication
+        Index("ix_conv_ws_channel_ident_status",
+              "workspace_id", "channel", "customer_identifier", "status"),
+    )
+
 
 class Booking(Base):
     """Appointment/reservation created by an agent."""
@@ -218,3 +224,7 @@ class Booking(Base):
     # confirmed | cancelled | completed
     notes = Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        Index("ix_booking_ws_date_time", "workspace_id", "booking_date", "booking_time"),
+    )
