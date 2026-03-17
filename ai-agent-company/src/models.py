@@ -1,7 +1,7 @@
 from datetime import datetime
 from sqlalchemy import (
     Column, Integer, String, Float, Boolean,
-    DateTime, ForeignKey, Text
+    DateTime, ForeignKey, Text, JSON
 )
 from sqlalchemy.orm import relationship
 from src.database import Base
@@ -126,3 +126,95 @@ class AgentEvent(Base):
 
     agent = relationship("Agent")
     ticket = relationship("Ticket")
+
+
+# ---------------------------------------------------------------------------
+# Multi-tenant / SaaS models
+# ---------------------------------------------------------------------------
+
+class Workspace(Base):
+    """One workspace = one SME customer."""
+    __tablename__ = "workspaces"
+
+    id = Column(Integer, primary_key=True, index=True)
+    company_id = Column(Integer, ForeignKey("companies.id"), nullable=True)
+    name = Column(String, nullable=False)
+    industry = Column(String, default="custom")
+    # restaurante | clinica | tienda | custom
+
+    # Contact / channel config
+    whatsapp_number = Column(String, nullable=True)   # E.164 e.g. +34612345678
+    email = Column(String, nullable=True)
+    phone = Column(String, nullable=True)
+
+    # Business info fed to agents via get_business_info()
+    business_info = Column(JSON, nullable=True)
+    # { "nombre": "...", "horarios": "...", "servicios": [...],
+    #   "precios": "...", "direccion": "...", "faqs": [...] }
+
+    # Subscription
+    plan = Column(String, default="trial")
+    # trial | basico | profesional | empresa
+    trial_ends_at = Column(DateTime, nullable=True)
+    monthly_message_limit = Column(Integer, default=100)
+    messages_used_this_month = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    company = relationship("Company")
+    users = relationship("User", back_populates="workspace")
+    conversations = relationship("Conversation", back_populates="workspace")
+
+
+class User(Base):
+    """Dashboard login for an SME operator."""
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    email = Column(String, unique=True, nullable=False, index=True)
+    hashed_password = Column(String, nullable=False)
+    full_name = Column(String, nullable=True)
+    is_active = Column(Boolean, default=True)
+    is_admin = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    workspace = relationship("Workspace", back_populates="users")
+
+
+class Conversation(Base):
+    """One ongoing customer conversation on any channel."""
+    __tablename__ = "conversations"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    channel = Column(String, nullable=False)
+    # whatsapp | email | web
+    customer_identifier = Column(String, nullable=False)
+    # phone number (whatsapp) or email address
+    customer_name = Column(String, nullable=True)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=True)
+    status = Column(String, default="active")
+    # active | resolved
+    created_at = Column(DateTime, default=datetime.utcnow)
+    last_message_at = Column(DateTime, default=datetime.utcnow)
+
+    workspace = relationship("Workspace", back_populates="conversations")
+    ticket = relationship("Ticket")
+
+
+class Booking(Base):
+    """Appointment/reservation created by an agent."""
+    __tablename__ = "bookings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    workspace_id = Column(Integer, ForeignKey("workspaces.id"), nullable=False)
+    ticket_id = Column(Integer, ForeignKey("tickets.id"), nullable=True)
+    customer_name = Column(String, nullable=False)
+    customer_contact = Column(String, nullable=True)
+    service = Column(String, nullable=True)
+    booking_date = Column(String, nullable=False)   # ISO date string
+    booking_time = Column(String, nullable=False)   # HH:MM
+    status = Column(String, default="confirmed")
+    # confirmed | cancelled | completed
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)

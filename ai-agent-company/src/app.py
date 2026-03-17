@@ -507,6 +507,96 @@ def do_auto_decompose(goal_id, agent_id):
 
 
 # ---------------------------------------------------------------------------
+# Setup Wizard (GestorIA)
+# ---------------------------------------------------------------------------
+
+def setup_wizard_apply(industry, business_info_json, whatsapp_number, email_address):
+    """Apply an industry template to a new or existing workspace."""
+    from src.templates.loader import load_template, create_workspace, PLAN_LIMITS
+    from src.models import Workspace
+    import json as _json
+
+    if not industry:
+        return "Selecciona un sector."
+
+    try:
+        info = _json.loads(business_info_json) if business_info_json.strip() else {}
+    except Exception:
+        return "El JSON de información del negocio no es válido."
+
+    db = _db()
+    try:
+        # Find or create workspace
+        ws = db.query(Workspace).first()
+        if not ws:
+            ws = Workspace(
+                name=info.get("nombre", "Mi Negocio"),
+                industry=industry,
+                plan="trial",
+                monthly_message_limit=100,
+            )
+            db.add(ws)
+            db.flush()
+
+        if whatsapp_number.strip():
+            ws.whatsapp_number = whatsapp_number.strip()
+        if email_address.strip():
+            ws.email = email_address.strip()
+        db.commit()
+        ws_id = ws.id
+    finally:
+        db.close()
+
+    result = load_template(ws_id, industry, info)
+    from src.scheduler import sync_agent_schedules
+    sync_agent_schedules()
+    return result
+
+
+def get_template_fields_md(industry):
+    """Return a markdown guide for what to include in the business_info JSON."""
+    from src.templates.loader import get_template_fields
+    fields = get_template_fields(industry)
+    if not fields:
+        return "Selecciona un sector para ver los campos recomendados."
+    lines = ["**Campos recomendados para `business_info` (JSON):**\n```json\n{"]
+    for key, label, placeholder in fields:
+        lines.append(f'  "{key}": "{placeholder}",  // {label}')
+    lines.append("}\n```")
+    return "\n".join(lines)
+
+
+def conversations_list():
+    """List recent customer conversations across all workspaces."""
+    db = _db()
+    try:
+        from src.models import Conversation
+        convs = (
+            db.query(Conversation)
+            .order_by(Conversation.last_message_at.desc())
+            .limit(30)
+            .all()
+        )
+        if not convs:
+            return "No hay conversaciones todavía."
+        icons = {"whatsapp": "📱", "email": "📧", "web": "🌐"}
+        lines = []
+        for c in convs:
+            icon = icons.get(c.channel, "•")
+            name = c.customer_name or c.customer_identifier
+            ts = c.last_message_at.strftime("%d/%m %H:%M")
+            status_icon = "🟢" if c.status == "active" else "⚫"
+            lines.append(
+                f"{status_icon} {icon} **{name}** `{c.channel}` — "
+                f"último mensaje: {ts}"
+                + (f" [ticket #{c.ticket_id}]" if c.ticket_id else "")
+            )
+        return "\n\n".join(lines)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
 # Build Gradio UI
 # ---------------------------------------------------------------------------
 
@@ -515,14 +605,14 @@ def build_app():
     start_scheduler()
 
     with gr.Blocks(
-        title="AI Agent Company",
+        title="GestorIA — IA para PYMEs",
         theme=gr.themes.Soft(primary_hue="indigo"),
         css=".gradio-container { max-width: 1100px !important; }",
     ) as demo:
-        gr.Markdown("# 🏢 AI Agent Company")
+        gr.Markdown("# 🤖 GestorIA")
         gr.Markdown(
-            "Organize your Claude-powered AI agents into a real company "
-            "with org charts, goals, tickets, budgets, and scheduled heartbeats."
+            "Tu equipo de IA que atiende clientes 24/7 — por WhatsApp, email y más. "
+            "Configuración en 5 minutos."
         )
 
         # ── Dashboard ───────────────────────────────────────────────────────
@@ -880,6 +970,77 @@ def build_app():
                 inputs=[af_company, af_limit],
                 outputs=af_feed_md,
             )
+
+        # ── Conversaciones (clientes) ────────────────────────────────────────
+        with gr.Tab("💬 Conversaciones"):
+            gr.Markdown(
+                "Historial de conversaciones con clientes por WhatsApp y email."
+            )
+            conv_refresh_btn = gr.Button("🔄 Actualizar", variant="secondary")
+            conv_list_md = gr.Markdown(conversations_list())
+            conv_refresh_btn.click(conversations_list, outputs=conv_list_md)
+
+        # ── Asistente de Configuración ───────────────────────────────────────
+        with gr.Tab("⚙️ Configuración"):
+            gr.Markdown(
+                "## Asistente de Configuración\n"
+                "Configura tu equipo de IA en 4 pasos. "
+                "El sistema creará los agentes y los pondrá a trabajar automáticamente."
+            )
+            with gr.Row():
+                with gr.Column():
+                    gr.Markdown("### 1️⃣ Sector de tu negocio")
+                    wz_industry = gr.Radio(
+                        choices=[
+                            ("🍽️ Restaurante", "restaurante"),
+                            ("🏥 Clínica / Centro médico", "clinica"),
+                            ("🛍️ Tienda / Retail", "tienda"),
+                        ],
+                        label="¿A qué se dedica tu negocio?",
+                        value="restaurante",
+                    )
+                    wz_fields_md = gr.Markdown(get_template_fields_md("restaurante"))
+                    wz_industry.change(
+                        get_template_fields_md,
+                        inputs=wz_industry,
+                        outputs=wz_fields_md,
+                    )
+
+                with gr.Column():
+                    gr.Markdown("### 2️⃣ Canales de comunicación")
+                    wz_whatsapp = gr.Textbox(
+                        label="Número WhatsApp Business (E.164)",
+                        placeholder="+34612345678",
+                    )
+                    wz_email = gr.Textbox(
+                        label="Email de atención al cliente",
+                        placeholder="info@tunegocio.es",
+                    )
+
+            gr.Markdown("### 3️⃣ Información del negocio (JSON)")
+            gr.Markdown(
+                "Copia el template de arriba, rellena los valores y pégalo aquí. "
+                "Esta información la usarán los agentes para responder a tus clientes."
+            )
+            wz_info_json = gr.Textbox(
+                label="Información del negocio (JSON)",
+                placeholder='{"nombre": "Mi Restaurante", "horarios": "..."}',
+                lines=8,
+            )
+
+            gr.Markdown("### 4️⃣ Activar")
+            wz_activate_btn = gr.Button(
+                "🚀 Activar mi equipo de IA", variant="primary", scale=1
+            )
+            wz_result = gr.Textbox(
+                label="Resultado", lines=5, interactive=False
+            )
+
+            wz_activate_btn.click(
+                setup_wizard_apply,
+                inputs=[wz_industry, wz_info_json, wz_whatsapp, wz_email],
+                outputs=wz_result,
+            ).then(refresh_dashboard, outputs=dashboard_md)
 
         # ── Populate all dropdowns on load ───────────────────────────────────
         def load_all_companies():

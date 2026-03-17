@@ -1,8 +1,9 @@
 """Tool definitions and executors for AI agents."""
+import json
 from datetime import datetime
 from sqlalchemy.orm import Session
 
-from src.models import Agent, Ticket, TicketMessage, Goal, AgentEvent
+from src.models import Agent, Ticket, TicketMessage, Goal, AgentEvent, Workspace, Booking
 from src.database import SessionLocal
 
 # ---------------------------------------------------------------------------
@@ -135,6 +136,84 @@ AGENT_TOOLS = [
             "required": ["title", "message"],
         },
     },
+    # ── SME / Customer-facing tools ─────────────────────────────────────────
+    {
+        "name": "get_business_info",
+        "description": (
+            "Retrieve the business profile: opening hours, address, services, prices, and FAQs. "
+            "ALWAYS call this before answering any customer question about the business."
+        ),
+        "input_schema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
+        "name": "send_whatsapp_message",
+        "description": (
+            "Send a WhatsApp message to a customer phone number. "
+            "Use this to respond to a customer inquiry or confirm a booking."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to_phone": {
+                    "type": "string",
+                    "description": "Customer phone number in E.164 format, e.g. +34612345678",
+                },
+                "message": {
+                    "type": "string",
+                    "description": "The message text to send (max 1600 characters). Write in Spanish.",
+                },
+            },
+            "required": ["to_phone", "message"],
+        },
+    },
+    {
+        "name": "send_email",
+        "description": "Send an email to a customer.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to_email": {"type": "string", "description": "Recipient email address."},
+                "subject": {"type": "string", "description": "Email subject line."},
+                "body": {"type": "string", "description": "Email body text. Write in Spanish."},
+            },
+            "required": ["to_email", "subject", "body"],
+        },
+    },
+    {
+        "name": "check_availability",
+        "description": (
+            "Check whether a date/time slot is available for booking. "
+            "Returns available slots near the requested time."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
+                "time": {"type": "string", "description": "Requested time in HH:MM format."},
+                "service": {"type": "string", "description": "Name of the service/table/room requested."},
+            },
+            "required": ["date", "time"],
+        },
+    },
+    {
+        "name": "create_booking",
+        "description": (
+            "Create a confirmed booking/appointment for a customer. "
+            "Call check_availability first to verify the slot is free."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "customer_name": {"type": "string", "description": "Full name of the customer."},
+                "date": {"type": "string", "description": "Date in YYYY-MM-DD format."},
+                "time": {"type": "string", "description": "Time in HH:MM format."},
+                "service": {"type": "string", "description": "Service, table, or room being booked."},
+                "contact": {"type": "string", "description": "Customer phone or email for confirmation."},
+                "notes": {"type": "string", "description": "Any special requests or notes."},
+            },
+            "required": ["customer_name", "date", "time", "service", "contact"],
+        },
+    },
 ]
 
 
@@ -181,6 +260,39 @@ def execute_tool(
             return _escalate_to_boss(
                 tool_input["title"],
                 tool_input["message"],
+                agent, current_ticket, db,
+            )
+        # ── SME tools ──────────────────────────────────────────────────────
+        elif tool_name == "get_business_info":
+            return _get_business_info(agent, db)
+        elif tool_name == "send_whatsapp_message":
+            return _send_whatsapp(
+                tool_input["to_phone"],
+                tool_input["message"],
+                agent, current_ticket, db,
+            )
+        elif tool_name == "send_email":
+            return _send_email(
+                tool_input["to_email"],
+                tool_input["subject"],
+                tool_input["body"],
+                agent, current_ticket, db,
+            )
+        elif tool_name == "check_availability":
+            return _check_availability(
+                tool_input["date"],
+                tool_input["time"],
+                tool_input.get("service", ""),
+                agent, db,
+            )
+        elif tool_name == "create_booking":
+            return _create_booking(
+                tool_input["customer_name"],
+                tool_input["date"],
+                tool_input["time"],
+                tool_input["service"],
+                tool_input["contact"],
+                tool_input.get("notes", ""),
                 agent, current_ticket, db,
             )
         else:
@@ -364,3 +476,154 @@ def _log_event(
         event_type=event_type,
         summary=summary,
     ))
+
+
+# ---------------------------------------------------------------------------
+# SME tool executors
+# ---------------------------------------------------------------------------
+
+def _get_workspace_for_agent(agent: Agent, db: Session):
+    """Find the Workspace linked to an agent's company."""
+    return db.query(Workspace).filter(Workspace.company_id == agent.company_id).first()
+
+
+def _get_business_info(agent: Agent, db: Session) -> str:
+    workspace = _get_workspace_for_agent(agent, db)
+    if not workspace or not workspace.business_info:
+        return (
+            "No business information configured yet. "
+            "Ask the business owner to complete the setup wizard."
+        )
+    info = workspace.business_info
+    parts = [f"## Información de {info.get('nombre', 'el negocio')}"]
+    for key, label in [
+        ("horarios", "Horarios"), ("direccion", "Dirección"),
+        ("telefono", "Teléfono"), ("servicios", "Servicios"),
+        ("precios", "Precios"), ("faqs", "Preguntas frecuentes"),
+    ]:
+        if info.get(key):
+            val = info[key]
+            if isinstance(val, list):
+                val = "\n  - " + "\n  - ".join(str(v) for v in val)
+            parts.append(f"**{label}**: {val}")
+    return "\n".join(parts)
+
+
+def _send_whatsapp(
+    to_phone: str,
+    message: str,
+    agent: Agent,
+    current_ticket: Ticket,
+    db: Session,
+) -> str:
+    from src.channels.whatsapp import send_whatsapp
+    ok = send_whatsapp(to_phone, message)
+    result = "enviado" if ok else "error al enviar (revisa las credenciales de Twilio)"
+    _log_event(
+        db, agent, "whatsapp_sent",
+        f"WhatsApp a {to_phone}: {message[:80]}... [{result}]",
+        current_ticket.id if current_ticket else None,
+    )
+    db.commit()
+    return f"WhatsApp {result} a {to_phone}."
+
+
+def _send_email(
+    to_email: str,
+    subject: str,
+    body: str,
+    agent: Agent,
+    current_ticket: Ticket,
+    db: Session,
+) -> str:
+    from src.channels.email_channel import send_email
+    ok = send_email(to_email, subject, body)
+    result = "enviado" if ok else "error al enviar (revisa la configuración SMTP)"
+    _log_event(
+        db, agent, "email_sent",
+        f"Email a {to_email}: {subject} [{result}]",
+        current_ticket.id if current_ticket else None,
+    )
+    db.commit()
+    return f"Email {result} a {to_email}."
+
+
+def _check_availability(
+    date: str,
+    time: str,
+    service: str,
+    agent: Agent,
+    db: Session,
+) -> str:
+    workspace = _get_workspace_for_agent(agent, db)
+    if not workspace:
+        return "Workspace not found."
+
+    # Check existing bookings for conflicts
+    conflict = (
+        db.query(Booking)
+        .filter(
+            Booking.workspace_id == workspace.id,
+            Booking.booking_date == date,
+            Booking.booking_time == time,
+            Booking.status == "confirmed",
+        )
+        .first()
+    )
+
+    if conflict:
+        # Suggest nearby slots
+        h, m = map(int, time.split(":"))
+        alternatives = []
+        for delta in [-60, -30, 30, 60]:
+            total = h * 60 + m + delta
+            if 0 <= total < 24 * 60:
+                alternatives.append(f"{total // 60:02d}:{total % 60:02d}")
+        alts = ", ".join(alternatives) if alternatives else "ninguna disponible"
+        return (
+            f"El horario {time} del {date} ya está ocupado. "
+            f"Horas alternativas disponibles: {alts}."
+        )
+
+    return f"El horario {time} del {date} está disponible para '{service or 'reserva'}'."
+
+
+def _create_booking(
+    customer_name: str,
+    date: str,
+    time: str,
+    service: str,
+    contact: str,
+    notes: str,
+    agent: Agent,
+    current_ticket: Ticket,
+    db: Session,
+) -> str:
+    workspace = _get_workspace_for_agent(agent, db)
+    if not workspace:
+        return "Workspace not found."
+
+    booking = Booking(
+        workspace_id=workspace.id,
+        ticket_id=current_ticket.id if current_ticket else None,
+        customer_name=customer_name,
+        customer_contact=contact,
+        service=service,
+        booking_date=date,
+        booking_time=time,
+        notes=notes or "",
+        status="confirmed",
+    )
+    db.add(booking)
+    db.flush()
+
+    _log_event(
+        db, agent, "booking_created",
+        f"Reserva #{booking.id}: {customer_name} — {service} {date} {time}",
+        current_ticket.id if current_ticket else None,
+    )
+    db.commit()
+    return (
+        f"Reserva confirmada (#{booking.id}): {customer_name}, "
+        f"{service}, {date} a las {time}. Contacto: {contact}."
+    )

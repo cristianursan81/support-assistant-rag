@@ -21,5 +21,8 @@ def get_db():
 
 
 def init_db():
-    from src.models import Company, Agent, Goal, Ticket, TicketMessage, TokenUsage, AgentEvent  # noqa
+    from src.models import (  # noqa
+        Company, Agent, Goal, Ticket, TicketMessage, TokenUsage, AgentEvent,
+        Workspace, User, Conversation, Booking,
+    )
     Base.metadata.create_all(bind=engine)
