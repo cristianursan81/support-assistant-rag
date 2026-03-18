@@ -1,11 +1,16 @@
 # GestorIA — .dockerignore
-# Keeps the image lean and prevents secrets leaking into layers.
+# Keeps the image lean and prevents secrets from leaking into layers.
 
-.git
+# Version control
+.git/
 .gitignore
+.gitattributes
+
+# Secrets — never bake into image
 .env
-*.env
 .env.*
+*.env
+secrets/
 
 # Python bytecode / caches
 __pycache__/
@@ -19,10 +24,15 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+wheels/
 
-# Test / coverage
+# Tests & coverage (not needed at runtime)
+tests/
+test_*/
+*_test.py
 .pytest_cache/
 .coverage
+.coveragerc
 htmlcov/
 
 # Local DB files (persisted via Docker volume, not image layer)
@@ -31,8 +41,21 @@ htmlcov/
 *.sqlite3
 data/
 
+# Docs & assets (not needed at runtime)
+README.md
+docs/
+screenshots/
+*.md
+
 # Editor / OS noise
 .DS_Store
 .idea/
 .vscode/
 *.swp
+*.swo
+Thumbs.db
+
+# CI / tooling config
+.github/
+.pre-commit-config.yaml
+Makefile

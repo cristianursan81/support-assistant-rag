@@ -24,12 +24,15 @@ services:
       - "7861:7861"
     env_file:
       - .env
+    # Override CMD to run both API + dashboard (dev/single-container mode).
+    # Remove this override to use the production Gunicorn CMD from the Dockerfile.
+    command: ["python", "run.py"]
     volumes:
       - gestor_data:/app/data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       start_period: 20s
       retries: 3
     logging:
@@ -40,7 +43,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 768M
+          memory: 1536M
           cpus: "1.5"
 
 volumes:

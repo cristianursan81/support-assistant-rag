@@ -631,6 +631,9 @@ def build_app():
     init_db()
     start_scheduler()
 
+    # Gradio 6+: theme= and css= remain here in gr.Blocks() for 6.x.
+    # If a future release deprecates them here, move both kwargs to the
+    # demo.launch() call in run.py (migration pattern shown there).
     with gr.Blocks(
         title="GestorIA — IA para PYMEs",
         theme=gr.themes.Soft(primary_hue="indigo"),
