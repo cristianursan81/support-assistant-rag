@@ -6,10 +6,19 @@ and Gradio dashboard on port 7861 concurrently.
 """
 import sys
 import os
+import logging
 import threading
 import uvicorn
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+# Configure root logger before importing any src modules so every module
+# picks up the same level and format (container-friendly: no file handler).
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
 
 
 def run_api():
@@ -17,7 +26,7 @@ def run_api():
         "src.api:app",
         host="0.0.0.0",
         port=8000,
-        log_level="info",
+        log_level=os.getenv("LOG_LEVEL", "info").lower(),
         reload=False,
     )
 
