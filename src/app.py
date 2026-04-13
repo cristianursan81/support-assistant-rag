@@ -452,6 +452,7 @@ def build_interface() -> gr.Blocks:
                 show_label=False,
                 elem_classes="chatbot-wrap",
                 type="messages",
+                show_copy_button=True,
             )
 
             with gr.Row(elem_classes="input-wrap"):
