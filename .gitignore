@@ -1,5 +1,14 @@
 ﻿venv/
+.venv/
 chroma_db/
 .env
+.env.*
+.env.local
 __pycache__/
 *.pyc
+node_modules/
+
+# Secrets & keys
+*.key
+*.pem
+secrets*
